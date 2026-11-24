@@ -1,0 +1,20 @@
+[Unit]
+Description=NUC Control: phone control panel for server1 + the Distiller (127.0.0.1:8810, public via Tailscale Funnel :443)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nuc-panel
+Group=nuc-panel
+Environment=DATA_DIR=/var/lib/nuc-panel
+Environment=PORT=8810
+Environment=NODE_ENV=production
+ExecStart=/usr/local/bin/node /opt/nuc-control/server/main.mjs
+RuntimeDirectory=nuc-panel
+RuntimeDirectoryMode=0700
+Restart=always
+RestartSec=3
+# no ProtectSystem/PrivateTmp: nuc-ctl (sudo child) must see the real /etc, /boot and /tmp
+
+[Install]
+WantedBy=multi-user.target

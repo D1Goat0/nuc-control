@@ -1,0 +1,646 @@
+#!/usr/bin/python3 -I
+"""nuc-ctl: the one privileged helper NUC Control calls on each box.
+
+server1 runs it through sudo; the Distiller runs it as the forced command of the panel's ssh key
+(`nuc-ctl --ssh` reads SSH_ORIGINAL_COMMAND). Every action is whitelisted here and arguments are
+parsed, never handed to a shell. Output is always one JSON object on stdout.
+"""
+import glob, json, os, re, shlex, shutil, socket, subprocess, sys, time
+
+HOST = socket.gethostname()
+PI = os.path.exists('/boot/firmware/config.txt')
+BOX = {
+    'server1': {
+        'user': 'nuc',
+        'services': ['nucaloric-platform', 'nucaloric-calls', 'nuc-fetch', 'nuc-ai', 'nucaloric-local', 'ollama',
+                     'nuclink-ollama-tunnel', 'docker', 'tailscaled', 'nuc-control'],
+        'nostop': ['tailscaled', 'nuc-control'],
+        'du': ['/opt/nucaloric/ollama/models', '/var/lib/docker', '/opt/nucaloric/calls/data', '/opt/nucaloric/open-webui',
+               '/var/log/journal', '/home/nuc', '/var/cache/apt'],
+        'clean': ['journal', 'apt', 'docker', 'tmp'],
+    },
+    'distiller': {
+        'user': 'distiller',
+        # nucaloric-calls / -platform / -tunnel must never start here again (server1 is the only copy)
+        'services': ['ollama', 'nucaloric-hw', 'cpu-cap', 'distiller-hub', 'distiller-hub-tunnel', 'usb-link-gadget',
+                     'tailscaled', 'docker'],
+        'nostop': ['tailscaled'],
+        'du': ['/usr/share/ollama/.ollama/models', '/home/distiller/.config/chromium-headless', '/home/distiller/.npm',
+               '/var/log/journal', '/var/cache/apt', '/home/distiller', '/mnt/sdcard'],
+        'clean': ['journal', 'apt', 'chromium', 'npm', 'tmp'],
+    },
+}['distiller' if PI else 'server1']
+NAME = 'distiller' if PI else 'server1'
+ETC = '/etc/nucaloric'
+KEYS = f'{ETC}/ai-keys.env'
+CPU_CONF = f'{ETC}/cpu-panel.json'
+FAN_CONF = f'{ETC}/fan.json'
+CAP_FILE = f'{ETC}/cpu-max-khz'
+OLLAMA_DROPIN = '/etc/systemd/system/ollama.service.d/zzz-panel.conf'
+
+
+class Fail(Exception):
+    pass
+
+
+def rd(path, default=None):
+    try:
+        with open(path) as f: return f.read().strip()
+    except OSError: return default
+
+
+def rdi(path, default=None):
+    v = rd(path)
+    try: return int(v)
+    except (TypeError, ValueError): return default
+
+
+def wr(path, text):
+    tmp = path + '.tmp-panel'
+    with open(tmp, 'w') as f: f.write(text)
+    os.replace(tmp, path)
+
+
+def run(cmd, timeout=60, stdin=None, check=True):
+    p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout)
+    if check and p.returncode != 0:
+        raise Fail((p.stderr or p.stdout or f'{cmd[0]} failed').strip()[-400:])
+    return p.stdout
+
+
+def hwmon(name):
+    for h in glob.glob('/sys/class/hwmon/hwmon*'):
+        if rd(f'{h}/name') == name: return h
+    return None
+
+
+def stamp():
+    return time.strftime('%Y%m%d-%H%M%S')
+
+
+def backup(path):
+    if os.path.exists(path): shutil.copy2(path, f'{path}.bak-panel-{stamp()}')
+
+
+# ---------- stats (polled every few seconds, keep it cheap) ----------
+
+def cpu_times():
+    with open('/proc/stat') as f: v = [int(x) for x in f.readline().split()[1:]]
+    return sum(v), v[3] + v[4]
+
+
+def meminfo():
+    m = {}
+    with open('/proc/meminfo') as f:
+        for line in f:
+            k, v = line.split(':', 1)
+            m[k] = int(v.split()[0]) * 1024
+    return m
+
+
+def mounts():
+    out = []
+    with open('/proc/mounts') as f:
+        for line in f:
+            dev, mnt = line.split()[:2]
+            if mnt == '/' or mnt.startswith('/mnt/') or mnt == '/boot/firmware':
+                try: s = os.statvfs(mnt)
+                except OSError: continue
+                out.append({'mount': mnt, 'dev': dev, 'total': s.f_blocks * s.f_frsize, 'free': s.f_bavail * s.f_frsize})
+    return out
+
+
+def policy():
+    p = '/sys/devices/system/cpu/cpu0/cpufreq'
+    return {
+        'governor': rd(f'{p}/scaling_governor'),
+        'governors': (rd(f'{p}/scaling_available_governors') or '').split(),
+        'maxKhz': rdi(f'{p}/scaling_max_freq'),
+        'minKhz': rdi(f'{p}/scaling_min_freq'),
+        'hwMaxKhz': rdi(f'{p}/cpuinfo_max_freq'),
+        'hwMinKhz': rdi(f'{p}/cpuinfo_min_freq'),
+        'steps': [int(x) for x in (rd(f'{p}/scaling_available_frequencies') or '').split()],
+        'boost': rdi('/sys/devices/system/cpu/cpufreq/boost'),
+    }
+
+
+def cmd_stats(_):
+    a = cpu_times(); time.sleep(0.4); b = cpu_times()
+    busy = 1 - (b[1] - a[1]) / max(1, b[0] - a[0])
+    freqs = [rdi(f) for f in glob.glob('/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq')]
+    freqs = [f for f in freqs if f]
+    m = meminfo()
+    up = float(rd('/proc/uptime', '0').split()[0])
+    load = rd('/proc/loadavg', '0 0 0').split()[:3]
+    t = hwmon('k10temp') or hwmon('cpu_thermal')
+    s = {
+        'box': NAME, 'host': HOST, 'at': int(time.time() * 1000), 'uptimeSec': int(up),
+        'cpu': round(busy * 100, 1), 'cores': os.cpu_count(), 'load': [float(x) for x in load],
+        'mhz': round(sum(freqs) / len(freqs) / 1000) if freqs else None,
+        'tempC': (rdi(f'{t}/temp1_input') or 0) / 1000 if t else None,
+        'mem': {'total': m.get('MemTotal'), 'avail': m.get('MemAvailable'), 'cached': m.get('Cached', 0) + m.get('Buffers', 0),
+                'swapTotal': m.get('SwapTotal'), 'swapFree': m.get('SwapFree')},
+        'disks': mounts(),
+        'policy': policy(),
+        'swappiness': rdi('/proc/sys/vm/swappiness'),
+    }
+    g = hwmon('amdgpu')
+    if g:
+        s['gpu'] = {'tempC': (rdi(f'{g}/temp1_input') or 0) / 1000, 'mhz': round((rdi(f'{g}/freq1_input') or 0) / 1e6),
+                    'watts': round((rdi(f'{g}/power1_input') or rdi(f'{g}/power1_average') or 0) / 1e6, 1)}
+        try:
+            vram = glob.glob('/sys/class/drm/card*/device/mem_info_gtt_total')
+            if vram: s['gpu']['gttTotal'] = rdi(vram[0]); s['gpu']['gttUsed'] = rdi(vram[0].replace('total', 'used'))
+        except OSError: pass
+    pw = hwmon('fam15h_power')
+    if pw: s['cpuWatts'] = round((rdi(f'{pw}/power1_input') or 0) / 1e6, 1)
+    f = hwmon('pwmfan')
+    if f: s['fan'] = {'rpm': rdi(f'{f}/fan1_input'), 'pwm': rdi(f'{f}/pwm1'), 'control': 'panel'}
+    elif hwmon('hp'): s['fan'] = {'rpm': None, 'pwm': None, 'control': 'bios'}
+    for ps in glob.glob('/sys/class/power_supply/*'):
+        cap = rdi(f'{ps}/capacity')
+        if cap is not None: s['battery'] = {'pct': cap, 'status': rd(f'{ps}/status')}
+    if PI:
+        s['capKhz'] = rdi(CAP_FILE)
+        try: s['throttled'] = run(['vcgencmd', 'get_throttled'], 5).strip().split('=')[-1]
+        except Exception: pass
+    return s
+
+
+# ---------- info (on demand) ----------
+
+def ollama_env():
+    out = run(['systemctl', 'show', 'ollama', '-p', 'Environment', '--value'], 10, check=False)
+    env = {}
+    for tok in shlex.split(out):
+        k, _, v = tok.partition('=')
+        if k.startswith('OLLAMA_'): env[k] = v
+    return env
+
+
+def config_txt():
+    txt = rd('/boot/firmware/config.txt', '')
+    v = {}
+    for line in txt.splitlines():
+        m = re.match(r'^\s*(arm_freq|arm_boost|arm_freq_min|over_voltage\w*)\s*=\s*(\S+)', line)
+        if m: v[m.group(1)] = m.group(2)
+    return v
+
+
+def cmd_info(_):
+    i = {'box': NAME, 'host': HOST, 'kernel': os.uname().release, 'arch': os.uname().machine,
+         'os': (re.search(r'PRETTY_NAME="([^"]+)"', rd('/etc/os-release', '')) or [None, None])[1],
+         'policy': policy(), 'ollamaEnv': ollama_env(), 'swappiness': rdi('/proc/sys/vm/swappiness'), 'clean': BOX['clean']}
+    try: i['cpuModel'] = re.search(r'model name\s*:\s*(.+)', rd('/proc/cpuinfo', '')).group(1)
+    except AttributeError: i['cpuModel'] = 'Raspberry Pi CM5 (Cortex-A76)' if PI else None
+    if PI:
+        i['config'] = config_txt(); i['capKhz'] = rdi(CAP_FILE)
+        try: i['fan'] = json.loads(rd(FAN_CONF, '{}'))
+        except ValueError: i['fan'] = {}
+    else:
+        try: i['secureBoot'] = 'enabled' in run(['mokutil', '--sb-state'], 10, check=False)
+        except Exception: i['secureBoot'] = None
+        try: i['cpuPanel'] = json.loads(rd(CPU_CONF, '{}'))
+        except ValueError: i['cpuPanel'] = {}
+        i['ocScript'] = os.path.exists('/home/nuc/oc/oc-push.sh')
+        i['lvm'] = lvm()
+    return i
+
+
+# ---------- services ----------
+
+def cmd_services(_):
+    out = []
+    for u in BOX['services']:
+        props = run(['systemctl', 'show', f'{u}.service', '-p', 'LoadState,ActiveState,SubState,UnitFileState,ActiveEnterTimestampMonotonic,MemoryCurrent,Description,NRestarts'], 10, check=False)
+        p = dict(l.split('=', 1) for l in props.splitlines() if '=' in l)
+        if p.get('LoadState') == 'not-found': continue
+        since = int(p.get('ActiveEnterTimestampMonotonic') or 0)
+        mono = time.clock_gettime(time.CLOCK_MONOTONIC)
+        mem = p.get('MemoryCurrent', '')
+        out.append({'unit': u, 'desc': p.get('Description', ''), 'active': p.get('ActiveState'), 'sub': p.get('SubState'),
+                    'enabled': p.get('UnitFileState'), 'upSec': int(mono - since / 1e6) if since and p.get('ActiveState') == 'active' else 0,
+                    'mem': int(mem) if mem.isdigit() else None, 'restarts': int(p.get('NRestarts') or 0),
+                    'canStop': u not in BOX['nostop']})
+    return {'services': out}
+
+
+def unit_arg(u):
+    if u not in BOX['services']: raise Fail(f'{u} is not a managed service on {NAME}')
+    return u
+
+
+def cmd_svc(a):
+    action, u = a[0], unit_arg(a[1])
+    if action not in ('start', 'stop', 'restart'): raise Fail('action must be start, stop or restart')
+    if action == 'stop' and u in BOX['nostop']: raise Fail(f'{u} keeps this panel reachable; it can be restarted, not stopped')
+    if u == 'nuc-control':  # restarting ourselves: answer first, restart a moment later
+        run(['systemd-run', '--on-active=2', '--unit', f'nuc-control-restart-{stamp()}', 'systemctl', 'restart', 'nuc-control.service'], 15)
+        return {'ok': True, 'note': 'panel restarts in 2 s'}
+    run(['systemctl', action, f'{u}.service'], 90)
+    return {'ok': True}
+
+
+def cmd_logs(a):
+    u = unit_arg(a[0])
+    n = max(10, min(400, int(a[1]) if len(a) > 1 else 120))
+    return {'lines': run(['journalctl', '-u', f'{u}.service', '-n', str(n), '--no-pager', '-o', 'short-iso'], 20, check=False).splitlines()}
+
+
+def cmd_reboot(_):
+    run(['systemd-run', '--on-active=3', '--unit', f'nuc-panel-reboot-{stamp()}', 'systemctl', 'reboot'], 15)
+    return {'ok': True, 'note': f'{NAME} reboots in 3 s'}
+
+
+# ---------- cpu: governor / max clock / boost (server1), live cap + boot clock (Distiller) ----------
+
+def set_all(name, value):
+    for p in glob.glob(f'/sys/devices/system/cpu/cpufreq/policy*/{name}'):
+        with open(p, 'w') as f: f.write(str(value))
+
+
+def cpu_apply(conf):
+    if conf.get('governor'): set_all('scaling_governor', conf['governor'])
+    if conf.get('maxKhz'): set_all('scaling_max_freq', conf['maxKhz'])
+    if conf.get('boost') is not None and os.path.exists('/sys/devices/system/cpu/cpufreq/boost'):
+        with open('/sys/devices/system/cpu/cpufreq/boost', 'w') as f: f.write(str(int(conf['boost'])))
+
+
+PROFILES = {  # server1 power profiles (fan speed is BIOS-only on the HP, so heat is controlled through the clock)
+    'quiet': {'governor': 'schedutil', 'maxKhz': 2100000, 'boost': 0},
+    'balanced': {'governor': 'schedutil', 'maxKhz': None, 'boost': 1},
+    'performance': {'governor': 'performance', 'maxKhz': None, 'boost': 1},
+}
+
+
+def cmd_cpu(a):
+    op = a[0]
+    pol = policy()
+    if PI:
+        if op == 'cap':
+            khz = int(a[1])
+            boot = int(config_txt().get('arm_freq', 1500)) * 1000
+            if not 600000 <= khz <= boot: raise Fail(f'cap must be between 600 MHz and the boot clock ({boot // 1000} MHz)')
+            wr(CAP_FILE, f'{khz}\n'); set_all('scaling_max_freq', khz)
+            return {'ok': True, 'capKhz': khz}
+        if op == 'bootclock':
+            mhz = int(a[1])
+            if mhz not in (1500, 1800, 2000, 2200, 2400): raise Fail('boot clock must be 1500, 1800, 2000, 2200 or 2400 MHz')
+            path = '/boot/firmware/config.txt'
+            txt = rd(path, '')
+            backup(path)
+            txt = re.sub(r'(?m)^\s*arm_freq\s*=.*$', f'arm_freq={mhz}', txt) if re.search(r'(?m)^\s*arm_freq\s*=', txt) else txt + f'\narm_freq={mhz}\n'
+            if not re.search(r'(?m)^\s*arm_boost\s*=', txt): txt += 'arm_boost=1\n'
+            with open(path, 'w') as f: f.write(txt + ('' if txt.endswith('\n') else '\n'))
+            wr(CAP_FILE, f'{mhz * 1000}\n')
+            return {'ok': True, 'note': f'boot clock {mhz} MHz after the next reboot'}
+        raise Fail('the Distiller takes cpu cap or cpu bootclock')
+    conf = json.loads(rd(CPU_CONF, '{}') or '{}')
+    if op == 'profile':
+        if a[1] not in PROFILES: raise Fail('profile must be quiet, balanced or performance')
+        conf = dict(PROFILES[a[1]], profile=a[1])
+        if not conf['maxKhz']: conf['maxKhz'] = pol['hwMaxKhz']
+    elif op == 'governor':
+        if a[1] not in pol['governors']: raise Fail('unknown governor')
+        conf.update(governor=a[1], profile='custom')
+    elif op == 'maxfreq':
+        khz = int(a[1])
+        if khz not in pol['steps'] and khz != pol['hwMaxKhz']: raise Fail('pick one of the listed clock steps')
+        conf.update(maxKhz=khz, profile='custom')
+    elif op == 'boost':
+        conf.update(boost=int(a[1] == '1'), profile='custom')
+    elif op == 'apply':  # at boot, from nuc-cpu-apply.service
+        cpu_apply(conf); return {'ok': True}
+    else:
+        raise Fail('unknown cpu op')
+    cpu_apply(conf)
+    wr(CPU_CONF, json.dumps(conf) + '\n')
+    return {'ok': True, 'conf': conf, 'policy': policy()}
+
+
+# ---------- fan (Distiller: nucaloric-hw.service reads fan.json every loop) ----------
+
+FAN = {
+    'auto': {'quietHours': [[23, 8]], 'quietCap': 120, 'hotOverride': 62, 'boostHours': [], 'boostMin': 200},
+    'quiet': {'loadCurve': [[0, 50], [1, 110], [2, 160]], 'tempCurve': [[45, 50], [58, 140], [66, 255]], 'quietHours': [], 'hotOverride': 62},
+    'performance': {'loadCurve': [[0, 150], [0.5, 200], [1, 255]], 'tempCurve': [[40, 150], [55, 220], [62, 255]], 'quietHours': []},
+    'max': {'loadCurve': [[0, 255], [2, 255]], 'tempCurve': [[0, 255], [100, 255]], 'quietHours': [], 'quietCap': 255, 'boostMin': 255},
+}
+
+
+def cmd_fan(a):
+    if not PI: raise Fail('the HP 705 G3 fan is run by the BIOS (Linux writes are refused); use the power profile to cut heat')
+    preset = a[0]
+    if preset == 'fixed':
+        pct = max(0, min(100, int(a[1])))
+        v = round(pct * 2.55)
+        conf = {'loadCurve': [[0, v], [2, v]], 'tempCurve': [[0, v], [60, max(v, 190)], [70, 255]], 'quietHours': [], 'pct': pct}
+    elif preset in FAN:
+        conf = dict(FAN[preset])
+    else:
+        raise Fail('fan preset must be auto, quiet, performance, max or fixed')
+    conf['preset'] = preset
+    conf['_note'] = f'set from NUC Control {stamp()}'
+    backup(FAN_CONF)
+    wr(FAN_CONF, json.dumps(conf) + '\n')
+    for old in sorted(glob.glob(f'{FAN_CONF}.bak-panel-*'))[:-5]: os.remove(old)
+    return {'ok': True, 'fan': conf}
+
+
+# ---------- memory ----------
+
+OLLAMA_KEYS = {
+    'OLLAMA_KEEP_ALIVE': r'^(-1|0|\d{1,4}[smh])$',
+    'OLLAMA_MAX_LOADED_MODELS': r'^[1-4]$',
+    'OLLAMA_NUM_PARALLEL': r'^[1-4]$',
+    'OLLAMA_CONTEXT_LENGTH': r'^(2048|4096|8192|16384|32768|65536)$',
+}
+
+
+def cmd_mem(a):
+    op = a[0]
+    if op == 'dropcaches':
+        before = meminfo()['MemAvailable']
+        os.sync()
+        with open('/proc/sys/vm/drop_caches', 'w') as f: f.write('3')
+        return {'ok': True, 'freed': meminfo()['MemAvailable'] - before}
+    if op == 'swappiness':
+        n = int(a[1])
+        if not 0 <= n <= 100: raise Fail('swappiness is 0-100')
+        with open('/proc/sys/vm/swappiness', 'w') as f: f.write(str(n))
+        wr('/etc/sysctl.d/90-nuc-panel.conf', f'# NUC Control\nvm.swappiness={n}\n')
+        return {'ok': True}
+    raise Fail('mem takes dropcaches or swappiness')
+
+
+def cmd_ollama_env(a):
+    """ollama-env KEY VALUE [KEY VALUE ...]: one drop-in, one restart."""
+    if not a or len(a) % 2: raise Fail('give KEY VALUE pairs')
+    cur = {}
+    for line in (rd(OLLAMA_DROPIN, '') or '').splitlines():
+        m = re.match(r'^Environment=(OLLAMA_\w+)=(.*)$', line)
+        if m: cur[m.group(1)] = m.group(2)
+    for k, v in zip(a[::2], a[1::2]):
+        if k not in OLLAMA_KEYS or not re.match(OLLAMA_KEYS[k], v): raise Fail(f'{k}={v} is not an allowed Ollama setting')
+        cur[k] = v
+    os.makedirs(os.path.dirname(OLLAMA_DROPIN), exist_ok=True)
+    wr(OLLAMA_DROPIN, '# NUC Control (sorts last, so these win)\n[Service]\n' + ''.join(f'Environment={x}={y}\n' for x, y in sorted(cur.items())))
+    run(['systemctl', 'daemon-reload'], 30)
+    run(['systemctl', 'restart', 'ollama.service'], 90)
+    return {'ok': True, 'env': ollama_env()}
+
+
+# ---------- storage ----------
+
+def lvm():
+    try:
+        vg = run(['vgs', '--noheadings', '--units', 'b', '--nosuffix', '-o', 'vg_name,vg_size,vg_free'], 15).split()
+        lv = run(['lvs', '--noheadings', '--units', 'b', '--nosuffix', '-o', 'lv_path,lv_size'], 15).split()
+        return {'vg': vg[0], 'vgSize': int(vg[1]), 'vgFree': int(vg[2]), 'lv': lv[0], 'lvSize': int(lv[1])}
+    except Exception:
+        return None
+
+
+def cmd_storage(_):
+    dirs = []
+    for d in BOX['du']:
+        if not os.path.isdir(d): continue
+        try:
+            out = run(['timeout', '25', 'du', '-sxb', d], 30, check=False).split()
+            dirs.append({'path': d, 'bytes': int(out[0]) if out else None})
+        except Exception:
+            dirs.append({'path': d, 'bytes': None})
+    return {'disks': mounts(), 'dirs': dirs, 'lvm': None if PI else lvm(), 'clean': BOX['clean']}
+
+
+def free_root():
+    s = os.statvfs('/'); return s.f_bavail * s.f_frsize
+
+
+def cmd_clean(a):
+    what = a[0]
+    if what not in BOX['clean']: raise Fail(f'{what} cleanup is not offered on {NAME}')
+    before = free_root()
+    if what == 'journal': run(['journalctl', '--vacuum-size=200M'], 120)
+    elif what == 'apt': run(['apt-get', 'clean'], 120)
+    elif what == 'docker':
+        run(['docker', 'image', 'prune', '-f'], 300); run(['docker', 'builder', 'prune', '-f'], 300)
+    elif what == 'npm': shutil.rmtree(f'/home/{BOX["user"]}/.npm/_cacache', ignore_errors=True)
+    elif what in ('chromium', 'tmp'):
+        # leaked headless-Chromium profiles + temp files older than 2 h (never anything a running bot is using)
+        pats = ['/tmp/nucaloric-chrome-*', '/var/tmp/nuc-bench*'] if what == 'tmp' else \
+               [f'/home/{BOX["user"]}/.config/chromium-headless/scoped_dir*', '/tmp/nucaloric-chrome-*']
+        cutoff = time.time() - 7200
+        for pat in pats:
+            for p in glob.glob(pat):
+                try:
+                    if os.lstat(p).st_mtime < cutoff:
+                        shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)
+                except OSError: pass
+    return {'ok': True, 'freed': max(0, free_root() - before)}
+
+
+def cmd_lv_grow(a):
+    if PI: raise Fail('the Distiller has no LVM volume to grow')
+    gb = int(a[0])
+    info = lvm()
+    if not info: raise Fail('LVM not found')
+    if not 1 <= gb <= info['vgFree'] // 2**30: raise Fail(f'pick 1-{info["vgFree"] // 2**30} GB')
+    out = run(['lvextend', '-r', '-L', f'+{gb}G', info['lv']], 600)
+    return {'ok': True, 'log': out.splitlines()[-4:], 'lvm': lvm()}
+
+
+# ---------- Claude / Codex keys ----------
+
+KEY_RE = {'anthropic': r'^sk-ant-[A-Za-z0-9_\-]{20,300}$', 'openai': r'^sk-[A-Za-z0-9_\-]{20,300}$'}
+KEY_VAR = {'anthropic': 'ANTHROPIC_API_KEY', 'openai': 'OPENAI_API_KEY'}
+PROFILE = '/etc/profile.d/nuc-ai-keys.sh'
+LOCAL_ONLY = ('ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL',
+              'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_MAX_CONTEXT_TOKENS', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS', 'MAX_THINKING_TOKENS')
+
+
+def keyfile():
+    k = {}
+    for line in (rd(KEYS, '') or '').splitlines():
+        m = re.match(r'^(\w+)=(.*)$', line)
+        if m: k[m.group(1)] = m.group(2)
+    return k
+
+
+def home():
+    return f'/home/{BOX["user"]}'
+
+
+def codex_cmd():
+    c = shutil.which('codex')
+    if c: return [c]
+    js = '/usr/lib/distiller-device/node_modules/@openai/codex/bin/codex.js'
+    return ['/usr/bin/node', js] if os.path.exists(js) else None
+
+
+def as_user(cmd, stdin=None, timeout=60):
+    return run(['runuser', '-u', BOX['user'], '--', 'env', f'HOME={home()}', 'PATH=/usr/local/bin:/usr/bin:/bin'] + cmd, timeout, stdin, check=False)
+
+
+def claude_settings_path():
+    return f'{home()}/.claude/settings.json'
+
+
+def claude_mode():
+    try: env = json.loads(rd(claude_settings_path(), '{}') or '{}').get('env', {})
+    except ValueError: return 'unknown'
+    if env.get('ANTHROPIC_BASE_URL'): return 'local'
+    return 'api' if env.get('ANTHROPIC_API_KEY') else 'login'
+
+
+def codex_auth():
+    try: a = json.loads(rd(f'{home()}/.codex/auth.json', '{}') or '{}')
+    except ValueError: return 'unknown'
+    if a.get('OPENAI_API_KEY'): return 'api-key'
+    return 'chatgpt' if a.get('tokens') else 'none'
+
+
+def save_keys(k):
+    wr(KEYS, '# NUC Control: Claude / Codex API keys for this box\n' + ''.join(f'{a}={b}\n' for a, b in sorted(k.items())))
+    os.chmod(KEYS, 0o640)
+    shutil.chown(KEYS, 'root', BOX['user'])
+    wr(PROFILE, f'# NUC Control: exports the API keys in {KEYS} to shells of the box user\n'
+                f'[ -r {KEYS} ] && set -a && . {KEYS} && set +a\n')
+    os.chmod(PROFILE, 0o644)
+    rc = f'{home()}/.bashrc'
+    line = f'[ -r {PROFILE} ] && . {PROFILE}  # NUC Control API keys\n'
+    if line not in (rd(rc, '') or '') + '\n':
+        with open(rc, 'a') as f: f.write('\n' + line)
+
+
+def cmd_keys(a):
+    op = a[0]
+    k = keyfile()
+    if op == 'status':
+        st = {}
+        for p, var in KEY_VAR.items():
+            v = k.get(var)
+            st[p] = {'set': bool(v), 'last4': v[-4:] if v else None, 'setAt': k.get(f'{var}_SET_AT')}
+        st['claudeCli'] = bool(shutil.which('claude')); st['codexCli'] = bool(codex_cmd())
+        st['claudeMode'] = claude_mode(); st['codexAuth'] = codex_auth()
+        return st
+    p = a[1]
+    if p not in KEY_VAR: raise Fail('provider must be anthropic or openai')
+    var = KEY_VAR[p]
+    if op == 'set':
+        key = sys.stdin.readline().strip()
+        if not re.match(KEY_RE[p], key): raise Fail(f'that does not look like an {p} API key')
+        k[var] = key; k[f'{var}_SET_AT'] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
+        save_keys(k)
+        note = []
+        if p == 'openai' and codex_cmd():
+            auth = f'{home()}/.codex/auth.json'
+            if os.path.exists(auth) and codex_auth() != 'api-key': shutil.copy2(auth, f'{auth}.bak-panel')  # keep the ChatGPT login
+            as_user(codex_cmd() + ['login', '--with-api-key'], stdin=key + '\n')
+            note.append(f'codex: {codex_auth()}')
+        return {'ok': True, 'note': ', '.join(note)}
+    if op == 'clear':
+        k.pop(var, None); k.pop(f'{var}_SET_AT', None)
+        save_keys(k)
+        if p == 'openai':
+            auth = f'{home()}/.codex/auth.json'
+            if os.path.exists(f'{auth}.bak-panel'): shutil.copy2(f'{auth}.bak-panel', auth); shutil.chown(auth, BOX['user'], BOX['user'])
+            elif codex_auth() == 'api-key': os.remove(auth)
+        if p == 'anthropic' and claude_mode() == 'api': claude_switch('login')
+        return {'ok': True}
+    if op == 'claude-mode':  # keys claude-mode anthropic api|local|login
+        return claude_switch(a[2])
+    raise Fail('keys takes status, set, clear or claude-mode')
+
+
+def claude_switch(mode):
+    path = claude_settings_path()
+    saved = f'{home()}/.claude/settings.local-models.json'
+    try: s = json.loads(rd(path, '{}') or '{}')
+    except ValueError: raise Fail('~/.claude/settings.json is not valid JSON')
+    env = s.setdefault('env', {})
+    if mode in ('api', 'login'):
+        if mode == 'api' and not keyfile().get('ANTHROPIC_API_KEY'): raise Fail('add an Anthropic key first')
+        if env.get('ANTHROPIC_BASE_URL'):  # leaving local-model mode: keep its settings to switch back
+            wr(saved, json.dumps({k: s[k] for k in ('model', 'modelPicker') if k in s} | {'env': {k: env[k] for k in LOCAL_ONLY if k in env}}, indent=2) + '\n')
+        backup(path)
+        for k2 in LOCAL_ONLY: env.pop(k2, None)
+        s.pop('model', None); s.pop('modelPicker', None)
+        if mode == 'api': env['ANTHROPIC_API_KEY'] = keyfile()['ANTHROPIC_API_KEY']
+        else: env.pop('ANTHROPIC_API_KEY', None)
+    elif mode == 'local':
+        if not os.path.exists(saved): raise Fail('no saved local-model settings on this box')
+        loc = json.loads(rd(saved))
+        backup(path)
+        env.pop('ANTHROPIC_API_KEY', None)
+        env.update(loc.get('env', {})); env['ANTHROPIC_API_KEY'] = ''
+        for k2 in ('model', 'modelPicker'):
+            if k2 in loc: s[k2] = loc[k2]
+    else:
+        raise Fail('mode is api, login or local')
+    if not env: s.pop('env', None)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    wr(path, json.dumps(s, indent=2) + '\n')
+    os.chmod(path, 0o600); shutil.chown(path, BOX['user'], BOX['user'])
+    return {'ok': True, 'claudeMode': claude_mode()}
+
+
+# ---------- benchmarks ----------
+
+def spin(sec):
+    end, n = time.perf_counter() + sec, 0
+    while time.perf_counter() < end:
+        x = 0
+        for i in range(2000): x += i * i % 7
+        n += 1
+    return n
+
+
+def cmd_bench(a):
+    kind = a[0]
+    if kind == 'cpu':
+        # plain integer work (no crypto instructions, so the AMD and ARM chips compare fairly), 3 s per run
+        import multiprocessing
+        n = os.cpu_count()
+        one = spin(3.0)
+        with multiprocessing.get_context('fork').Pool(n) as pool: alln = sum(pool.map(spin, [3.0] * n))
+        return {'kind': 'cpu', 'single': round(one / 3), 'multi': round(alln / 3), 'unit': 'work units/s'}
+    if kind == 'disk':
+        f = '/var/tmp/nuc-bench.bin'
+        def mbs(text):  # dd prints its summary on stderr
+            m = re.search(r'([\d.,]+)\s*([MG])B/s', text)
+            return round(float(m.group(1).replace(',', '.')) * (1000 if m.group(2) == 'G' else 1)) if m else None
+        p = subprocess.run(['dd', 'if=/dev/zero', f'of={f}', 'bs=1M', 'count=256', 'oflag=direct', 'conv=fdatasync'], capture_output=True, text=True, timeout=240)
+        write = mbs(p.stderr)
+        os.sync()
+        with open('/proc/sys/vm/drop_caches', 'w') as fh: fh.write('3')
+        p = subprocess.run(['dd', f'if={f}', 'of=/dev/null', 'bs=1M'], capture_output=True, text=True, timeout=240)  # cache dropped above: a real read
+        read = mbs(p.stderr)
+        try: os.remove(f)
+        except OSError: pass
+        return {'kind': 'disk', 'write': write, 'read': read, 'unit': 'MB/s, 256 MB direct'}
+    raise Fail('bench takes cpu or disk')
+
+
+CMDS = {'stats': cmd_stats, 'info': cmd_info, 'services': cmd_services, 'svc': cmd_svc, 'logs': cmd_logs, 'reboot': cmd_reboot,
+        'cpu': cmd_cpu, 'fan': cmd_fan, 'mem': cmd_mem, 'ollama-env': cmd_ollama_env, 'storage': cmd_storage,
+        'clean': cmd_clean, 'lv-grow': cmd_lv_grow, 'keys': cmd_keys, 'bench': cmd_bench}
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ['--ssh']:  # authorized_keys: command="sudo -n /usr/local/sbin/nuc-ctl --ssh \"$SSH_ORIGINAL_COMMAND\""
+        args = shlex.split(args[1] if len(args) > 1 else os.environ.get('SSH_ORIGINAL_COMMAND', ''))
+        if args[:1] == ['nuc-ctl']: args = args[1:]
+    if not args or args[0] not in CMDS:
+        print(json.dumps({'error': 'usage: nuc-ctl ' + '|'.join(CMDS)})); sys.exit(2)
+    for x in args:
+        if not re.match(r'^[A-Za-z0-9_.:\-]{1,64}$', x): print(json.dumps({'error': f'bad argument {x[:20]!r}'})); sys.exit(2)
+    try:
+        print(json.dumps(CMDS[args[0]](args[1:])))
+    except (Fail, ValueError, IndexError, OSError, subprocess.TimeoutExpired) as e:
+        print(json.dumps({'error': str(e) or type(e).__name__})); sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

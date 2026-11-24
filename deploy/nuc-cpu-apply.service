@@ -1,0 +1,10 @@
+[Unit]
+Description=NUC Control: re-apply the CPU governor / max clock / boost picked in the panel
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nuc-ctl cpu apply
+
+[Install]
+WantedBy=multi-user.target
